@@ -7,7 +7,37 @@ from urllib.parse import urljoin
 import _io
 import requests
 
+from dataclasses import dataclass
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ProjectExportArchiveConfig:
+    exportAll: bool = True
+    exportJobs: bool = True
+    exportExecutions: bool = True
+    exportConfigs: bool = True
+    exportReadmes: bool = True
+    exportAcls: bool = True
+    exportComponentsScheduleDefinitions: bool = True
+    exportScm: bool = True
+    exportWebhooks: bool = True
+    whkIncludeAuthTokens: bool = True
+
+    def to_dict(self):
+        return {
+            "exportAll": self.exportAll,
+            "exportJobs": self.exportJobs,
+            "exportExecutions": self.exportExecutions,
+            "exportConfigs": self.exportConfigs,
+            "exportReadmes": self.exportReadmes,
+            "exportAcls": self.exportAcls,
+            "exportComponentsScheduleDefinitions": self.exportComponentsScheduleDefinitions,  # noqa: E501
+            "exportScm": self.exportScm,
+            "exportWebhooks": self.exportWebhooks,
+            "whkIncludeAuthTokens": self.whkIncludeAuthTokens,
+        }
 
 
 class Rundeck(object):
@@ -17,7 +47,7 @@ class Rundeck(object):
         token=None,
         username=None,
         password=None,
-        api_version=18,
+        api_version=40,
         verify=True,
     ):
         self.rundeck_url = rundeck_url
@@ -45,7 +75,14 @@ class Rundeck(object):
         return r.cookies["JSESSIONID"]
 
     def __request(
-        self, method, url, params=None, upload_file=None, format="json"
+        self,
+        method,
+        url,
+        params=None,
+        upload_file=None,
+        format="json",
+        data=None,
+        stream=False,
     ):
         logger.info("{} {} Params: {}".format(method, url, params))
         cookies = dict()
@@ -67,12 +104,19 @@ class Rundeck(object):
         elif upload_file is not None:
             options["data"] = upload_file
             options["headers"]["Content-Type"] = "octet/stream"
+        elif data is not None:
+            options["data"] = data
+            options["headers"]["Content-Type"] = format
         else:
             options["json"] = params
 
-        r = requests.request(method, url, **options)
+        logger.info("Options: {}".format(options))
+        logger.info("method: {}".format(method))
+        r = requests.request(method, url, **options, stream=stream)
         logger.debug(r.text)
-        r.raise_for_status()
+        # r.raise_for_status()
+        if stream:
+            return r
         if format == "json":
             try:
                 return r.json()
@@ -82,17 +126,28 @@ class Rundeck(object):
         else:
             return r.text
 
-    def __get(self, url, params=None, format="json"):
-        valid_format = ["json", "xml", "yaml"]
+    def __get(self, url, params=None, format="json", stream=False):
+        valid_format = ["json", "xml", "yaml", "zip"]
         if format not in valid_format:
             raise ValueError(
                 "Invalid Format. Possible Values are: {}".format(
                     " ,".join(valid_format)
                 )
             )
-        return self.__request("GET", url, params, format=format)
+        return self.__request("GET", url, params, format=format, stream=stream)
 
-    def __post(self, url, params=None, upload_file=None):
+    def __post(
+        self, url, params=None, upload_file=None, content_type=None, data=None
+    ):
+        if content_type:
+            return self.__request(
+                "POST",
+                url,
+                params,
+                upload_file,
+                format=content_type,
+                data=data,
+            )
         return self.__request("POST", url, params, upload_file)
 
     def __delete(self, url, params=None):
@@ -170,6 +225,24 @@ class Rundeck(object):
         for p in self.list_projects():
             jobs += self.list_jobs(p["name"])
         return jobs
+
+    def list_storage_keys(self, path=None):
+        if path:
+            url = "{}/storage/{}".format(self.API_URL, path)
+        else:
+            url = "{}/storage/keys".format(self.API_URL)
+        return self.__get(url)
+
+    def get_storage_key(self, path):
+        url = "{}/storage/{}".format(self.API_URL, path)
+        return self.__get(url)
+
+    def add_storage_key_password(self, path, value):
+        url = "{}/storage/{}".format(self.API_URL, path)
+        data = value.encode("utf-8")
+        return self.__post(
+            url, data=data, content_type="application/x-rundeck-data-password"
+        )
 
     def get_job(self, name, project=None):
         if project:
@@ -332,6 +405,32 @@ class Rundeck(object):
             self.API_URL, project, resource
         )
         return self.__get(url)
+
+    def project_export_archive(
+        self, project, config: ProjectExportArchiveConfig, archive_path
+    ):
+        url = (
+            f"{self.API_URL}/project/{project}/export?"
+            f"exportAll={config.exportAll}&exportJobs={config.exportJobs}&"
+            f"exportExecutions={config.exportExecutions}&"
+            f"exportConfigs={config.exportConfigs}&"
+            f"exportReadmes={config.exportReadmes}&"
+            f"exportAcls={config.exportAcls}&exportComponents.Schedule%20"
+            f"Definitions={config.exportComponentsScheduleDefinitions}"
+        )
+        if self.api_version >= 28:
+            url += f"&exportScm={config.exportScm}"
+        if self.api_version >= 34:
+            url += (
+                f"&exportWebhooks={config.exportWebhooks}&"
+                f"whkIncludeAuthTokens={config.whkIncludeAuthTokens}"
+            )
+        r = self.__get(url, stream=True, format="zip")
+        with open(archive_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024):
+                if chunk:
+                    f.write(chunk)
+        return
 
 
 if __name__ == "__main__":
